@@ -1,0 +1,666 @@
+name: 打包 随谈 APK
+
+# 只有在网页上点按钮、或推送代码时才运行
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 1. 取出仓库文件
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 3. 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.6.0
+
+      - name: 4. 安装 Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 5. 下载 Gradle 8.9
+        run: |
+          curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          sudo unzip -q -o /tmp/gradle.zip -d /opt
+          /opt/gradle-8.9/bin/gradle --version
+
+      - name: 6. 准备 Android SDK 组件
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "SDK path: $SDK"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: 7. 准备网页文件
+        run: |
+          W=app/src/main/assets/www
+          rm -rf "$W"
+          mkdir -p "$W"
+
+          # 把任意解压目录整理成"index.html 在根目录"的结构
+          norm() {
+            root="$1"
+            if [ ! -f "$root/index.html" ]; then
+              idx=$(find "$root" -maxdepth 3 -name index.html | head -n 1)
+              if [ -n "$idx" ]; then root=$(dirname "$idx"); fi
+            fi
+            rm -rf "$W"
+            mkdir -p "$W"
+            cp -a "$root/." "$W/"
+          }
+
+          if [ -f suitan-source.zip ]; then
+            echo "== 使用仓库里的 suitan-source.zip 构建（含新增功能）=="
+            rm -rf /tmp/src
+            mkdir -p /tmp/src
+            unzip -q -o suitan-source.zip -d /tmp/src
+            ROOT=/tmp/src
+            if [ ! -f "$ROOT/package.json" ]; then
+              pkg=$(find /tmp/src -maxdepth 2 -name package.json | head -n 1)
+              if [ -n "$pkg" ]; then ROOT=$(dirname "$pkg"); fi
+            fi
+            echo "源码目录：$ROOT"
+            (cd "$ROOT" && pnpm install --frozen-lockfile && pnpm build)
+            norm "$ROOT/dist"
+            if grep -rq "随谈" "$W"; then
+              echo "✓ 新功能已进入构建产物"
+            else
+              echo "⚠ 产物里没有找到新功能标记（可能被转义压缩），以安装后的界面为准"
+            fi
+          else
+            echo "错误：仓库根目录缺少 suitan-source.zip，请先上传源码包"
+            exit 1
+          fi
+
+          if [ ! -f "$W/index.html" ]; then
+            echo "错误：没有找到 index.html"
+            exit 1
+          fi
+          find "$W" -maxdepth 2 | head -n 40
+          du -sh "$W"
+
+      - name: 8. 生成 Android 工程
+        run: |
+          mkdir -p app/src/main/java/com/suitan/companion
+          mkdir -p app/src/main/res/values app/src/main/res/drawable
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'suitan'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.suitan.companion'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.suitan.companion'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '0.1.0'
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file('release.keystore')
+                      storePassword 'chatdemo123'
+                      keyAlias 'chatdemo'
+                      keyPassword 'chatdemo123'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:hardwareAccelerated="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="随谈"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <item name="android:windowBackground">@android:color/white</item>
+                  <item name="android:statusBarColor">@android:color/white</item>
+                  <item name="android:navigationBarColor">@android:color/white</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#4D6BFE"
+                  android:pathData="M16,16h76v76h-76z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M32,34h44a8,8 0 0 1 8,8v22a8,8 0 0 1 -8,8h-20l-16,12v-12h-8a8,8 0 0 1 -8,-8v-22a8,8 0 0 1 8,-8z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/java/com/suitan/companion/MainActivity.java <<'JAVA'
+          package com.suitan.companion;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.util.Log;
+          import android.view.ViewGroup;
+          import android.webkit.ConsoleMessage;
+          import android.webkit.CookieManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.HashMap;
+          import java.util.Map;
+
+          public class MainActivity extends Activity {
+
+              private static final String TAG = "ChatDemo";
+              // 用官方线上站点的域名作为网页 origin，这样 DeepSeek API 的跨域放行规则和官方 demo 完全一致
+              private static final String SITE_ORIGIN = "https://deepseek-ai.github.io";
+              private static final int REQ_FILE_CHOOSER = 1001;
+              private static final int REQ_AUDIO = 1002;
+
+              private WebView webView;
+              private ValueCallback<Uri[]> pendingFileCallback;
+              private PermissionRequest pendingPermissionRequest;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  webView.setLayoutParams(new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT));
+                  webView.setBackgroundColor(Color.WHITE);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(false);
+                  settings.setAllowContentAccess(false);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setSupportZoom(false);
+                  settings.setTextZoom(100);
+                  settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  WebView.setWebContentsDebuggingEnabled(true);
+                  // 导出文件用的原生桥：网页里通过 window.AndroidSave 调用
+                  webView.addJavascriptInterface(new SaveBridge(), "AndroidSave");
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          Uri url = request.getUrl();
+                          if (url != null && "deepseek-ai.github.io".equals(url.getHost())) {
+                              return loadFromAssets(url);
+                          }
+                          return null;
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri url = request.getUrl();
+                          if (url == null) {
+                              return false;
+                          }
+                          if ("deepseek-ai.github.io".equals(url.getHost())) {
+                              return false;
+                          }
+                          String scheme = url.getScheme();
+                          if ("http".equals(scheme) || "https".equals(scheme)) {
+                              try {
+                                  startActivity(new Intent(Intent.ACTION_VIEW, url));
+                              } catch (Exception e) {
+                                  Log.w(TAG, "cannot open link", e);
+                              }
+                          }
+                          return true;
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+                          Log.d(TAG, consoleMessage.message() + " @" + consoleMessage.lineNumber());
+                          return true;
+                      }
+
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest request) {
+                          runOnUiThread(new Runnable() {
+                              @Override
+                              public void run() {
+                                  handlePermissionRequest(request);
+                              }
+                          });
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (pendingFileCallback != null) {
+                              pendingFileCallback.onReceiveValue(null);
+                              pendingFileCallback = null;
+                          }
+                          pendingFileCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), REQ_FILE_CHOOSER);
+                              return true;
+                          } catch (Exception e) {
+                              Log.w(TAG, "file chooser failed", e);
+                              pendingFileCallback = null;
+                              callback.onReceiveValue(null);
+                              return false;
+                          }
+                      }
+                  });
+
+                  webView.loadUrl(SITE_ORIGIN + "/index.html");
+              }
+
+              private void handlePermissionRequest(PermissionRequest request) {
+                  boolean wantsAudio = false;
+                  boolean wantsOther = false;
+                  for (String resource : request.getResources()) {
+                      if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) {
+                          wantsAudio = true;
+                      } else {
+                          wantsOther = true;
+                      }
+                  }
+                  if (wantsOther) {
+                      request.deny();
+                      return;
+                  }
+                  if (!wantsAudio) {
+                      request.grant(request.getResources());
+                      return;
+                  }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      request.grant(request.getResources());
+                      return;
+                  }
+                  pendingPermissionRequest = request;
+                  requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode != REQ_AUDIO || pendingPermissionRequest == null) {
+                      return;
+                  }
+                  boolean granted = grantResults.length > 0
+                          && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+                  try {
+                      if (granted) {
+                          pendingPermissionRequest.grant(pendingPermissionRequest.getResources());
+                      } else {
+                          pendingPermissionRequest.deny();
+                      }
+                  } catch (Exception e) {
+                      Log.w(TAG, "permission grant failed", e);
+                  }
+                  pendingPermissionRequest = null;
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == REQ_FILE_CHOOSER) {
+                      Uri[] results = null;
+                      if (resultCode == RESULT_OK) {
+                          if (data != null && data.getClipData() != null) {
+                              int count = data.getClipData().getItemCount();
+                              results = new Uri[count];
+                              for (int i = 0; i < count; i++) {
+                                  results[i] = data.getClipData().getItemAt(i).getUri();
+                              }
+                          } else if (data != null && data.getData() != null) {
+                              results = new Uri[]{data.getData()};
+                          }
+                      }
+                      if (pendingFileCallback != null) {
+                          pendingFileCallback.onReceiveValue(results);
+                          pendingFileCallback = null;
+                      }
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              private WebResourceResponse loadFromAssets(Uri url) {
+                  String path = url.getPath();
+                  if (path == null || path.isEmpty()) {
+                      path = "/index.html";
+                  }
+                  if (path.endsWith("/")) {
+                      path = path + "index.html";
+                  }
+                  try {
+                      InputStream stream = getAssets().open("www" + path);
+                      return new WebResourceResponse(guessMime(path), null, 200, "OK", assetHeaders(), stream);
+                  } catch (IOException e) {
+                      int lastDot = path.lastIndexOf('.');
+                      int lastSlash = path.lastIndexOf('/');
+                      if (lastDot < lastSlash) {
+                          try {
+                              InputStream stream = getAssets().open("www/index.html");
+                              return new WebResourceResponse("text/html", null, 200, "OK", assetHeaders(), stream);
+                          } catch (IOException ignored) {
+                          }
+                      }
+                      byte[] notFound = "Not Found".getBytes();
+                      return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", assetHeaders(),
+                              new ByteArrayInputStream(notFound));
+                  }
+              }
+
+              private static Map<String, String> assetHeaders() {
+                  Map<String, String> headers = new HashMap<>();
+                  headers.put("Cache-Control", "no-cache");
+                  headers.put("Access-Control-Allow-Origin", "*");
+                  return headers;
+              }
+
+              private static String guessMime(String path) {
+                  String lower = path.toLowerCase();
+                  if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+                      return "text/html";
+                  }
+                  if (lower.endsWith(".js") || lower.endsWith(".mjs")) {
+                      return "text/javascript";
+                  }
+                  if (lower.endsWith(".css")) {
+                      return "text/css";
+                  }
+                  if (lower.endsWith(".json") || lower.endsWith(".map")) {
+                      return "application/json";
+                  }
+                  if (lower.endsWith(".svg")) {
+                      return "image/svg+xml";
+                  }
+                  if (lower.endsWith(".png")) {
+                      return "image/png";
+                  }
+                  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+                      return "image/jpeg";
+                  }
+                  if (lower.endsWith(".gif")) {
+                      return "image/gif";
+                  }
+                  if (lower.endsWith(".webp")) {
+                      return "image/webp";
+                  }
+                  if (lower.endsWith(".ico")) {
+                      return "image/x-icon";
+                  }
+                  if (lower.endsWith(".woff2")) {
+                      return "font/woff2";
+                  }
+                  if (lower.endsWith(".woff")) {
+                      return "font/woff";
+                  }
+                  if (lower.endsWith(".ttf")) {
+                      return "font/ttf";
+                  }
+                  if (lower.endsWith(".wasm")) {
+                      return "application/wasm";
+                  }
+                  if (lower.endsWith(".txt") || lower.endsWith(".md")) {
+                      return "text/plain";
+                  }
+                  return "application/octet-stream";
+              }
+
+              /** 导出文件落盘：写到系统「下载/DeepSeek」目录，网页端用 window.AndroidSave 调用 */
+              private class SaveBridge {
+
+                  @JavascriptInterface
+                  public String saveText(String fileName, String text) {
+                      return saveBytes(fileName, "text/plain", text.getBytes(StandardCharsets.UTF_8));
+                  }
+
+                  @JavascriptInterface
+                  public String saveBase64(String fileName, String mimeType, String base64) {
+                      try {
+                          byte[] data = Base64.decode(base64, Base64.DEFAULT);
+                          return saveBytes(fileName, mimeType, data);
+                      } catch (Exception error) {
+                          return "err:" + error.getMessage();
+                      }
+                  }
+
+                  private String saveBytes(String fileName, String mimeType, byte[] data) {
+                      String safeName = fileName == null || fileName.trim().isEmpty() ? "export.txt" : fileName.trim();
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                              ContentValues values = new ContentValues();
+                              values.put(MediaStore.MediaColumns.DISPLAY_NAME, safeName);
+                              values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+                              values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                                      Environment.DIRECTORY_DOWNLOADS + "/DeepSeek");
+                              Uri uri = getContentResolver()
+                                      .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                              if (uri == null) {
+                                  return "err:cannot create file";
+                              }
+                              OutputStream output = getContentResolver().openOutputStream(uri);
+                              if (output == null) {
+                                  return "err:cannot open stream";
+                              }
+                              output.write(data);
+                              output.close();
+                              return "ok:Download/DeepSeek/" + safeName;
+                          }
+                          File dir = new File(
+                                  Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                                  "DeepSeek");
+                          if (!dir.exists() && !dir.mkdirs()) {
+                              return "err:cannot create dir";
+                          }
+                          File file = new File(dir, safeName);
+                          FileOutputStream output = new FileOutputStream(file);
+                          output.write(data);
+                          output.close();
+                          return "ok:" + file.getAbsolutePath();
+                      } catch (Exception error) {
+                          return "err:" + error.getMessage();
+                      }
+                  }
+              }
+
+              /* 返回键：能退页面就退，退不动就退出应用 */
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (webView != null) {
+                      webView.stopLoading();
+                      webView.destroy();
+                      webView = null;
+                  }
+                  super.onDestroy();
+              }
+          }
+          JAVA
+
+          echo "生成的文件："
+          find . \( -name "*.gradle" -o -name "*.properties" -o -name "*.java" -o -name "AndroidManifest.xml" \) -not -path "*/assets/*" | sort || true
+
+      - name: 9. 恢复或生成签名证书
+        uses: actions/cache@v4
+        with:
+          path: app/release.keystore
+          key: suitan-keystore-v1
+
+      - name: 10. 证书不存在就生成一个
+        run: |
+          if [ ! -f app/release.keystore ]; then
+            keytool -genkeypair -v -keystore app/release.keystore -alias chatdemo \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass chatdemo123 -keypass chatdemo123 \
+              -dname "CN=suitan, OU=demo, O=demo, L=Beijing, C=CN"
+          fi
+
+      - name: 11. 编译 APK
+        run: |
+          /opt/gradle-8.9/bin/gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: 12. 整理产物
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/suitan-v0.1-${{ github.run_number }}.apk"
+          ls -lh out
+          sha256sum out/*.apk
+
+      - name: 13. 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: suitan-apk
+          path: out/*.apk
+          retention-days: 30
+
+      - name: 14. 发布到 Releases（手机可直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          name: 随谈 APK
+          body: 随谈 的 Android 安装包，由 GitHub Actions 自动构建。
+          files: out/suitan-v0.1-${{ github.run_number }}.apk
+          make_latest: true
+
+      - name: 15. 打印下载地址
+        run: echo "APK 下载地址：https://github.com/${{ github.repository }}/releases/tag/apk-latest"
